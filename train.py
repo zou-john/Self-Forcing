@@ -3,6 +3,7 @@ import os
 from omegaconf import OmegaConf
 import wandb
 
+# four training modes: standard diffusion, gan, ode pre-init, and the main self-forcing distillation
 from trainer import DiffusionTrainer, GANTrainer, ODETrainer, ScoreDistillationTrainer
 
 
@@ -17,19 +18,21 @@ def main():
 
     args = parser.parse_args()
 
+    # merge experiment config on top of shared defaults
     config = OmegaConf.load(args.config_path)
     default_config = OmegaConf.load("configs/default_config.yaml")
     config = OmegaConf.merge(default_config, config)
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
 
-    # get the filename of config_path
+    # use the yaml filename as a run identifier (e.g. "self_forcing_dmd")
     config_name = os.path.basename(args.config_path).split(".")[0]
     config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb
 
+    # pick trainer based on config — for self-forcing use "score_distillation"
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)
     elif config.trainer == "gan":

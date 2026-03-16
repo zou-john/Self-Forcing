@@ -41,6 +41,13 @@ Create a conda environment and install dependencies:
 ```
 conda create -n self_forcing python=3.10 -y
 conda activate self_forcing
+
+conda install nvidia/label/cuda-12.4.1::cuda
+# if the above breaks then run this `conda clean --packages --tarballs`
+
+conda install -c nvidia/label/cuda-12.4.1 cudatoolkit
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --upgrade "pip<24"
 pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 python setup.py develop
@@ -50,6 +57,7 @@ python setup.py develop
 ### Download checkpoints
 ```
 huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir-use-symlinks False --local-dir wan_models/Wan2.1-T2V-1.3B
+huggingface-cli download alibaba-pai/Wan2.1-Fun-1.3B-InP --local-dir ./Wan2.1-Fun-1.3B-InP 
 huggingface-cli download gdhe17/Self-Forcing checkpoints/self_forcing_dmd.pt --local-dir .
 ```
 

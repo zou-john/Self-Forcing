@@ -26,7 +26,7 @@ parser.add_argument("--data_path", type=str, help="Path to the dataset")
 parser.add_argument("--extended_prompt_path", type=str, help="Path to the extended prompt")
 parser.add_argument("--output_folder", type=str, help="Output folder")
 parser.add_argument("--num_output_frames", type=int, default=21,
-                    help="Number of overlap frames between sliding windows")
+                    help="Number of overlap frames between slidincag windows")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -35,13 +35,14 @@ parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
 args = parser.parse_args()
 
-# Initialize distributed inference
+# set up multi-gpu inference via nccl; falls back to single-gpu if LOCAL_RANK not set
 if "LOCAL_RANK" in os.environ:
     dist.init_process_group(backend='nccl')
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     world_size = dist.get_world_size()
+    # different seed per rank so each gpu generates distinct samples
     set_seed(args.seed + local_rank)
 else:
     device = torch.device("cuda")
@@ -50,6 +51,7 @@ else:
     set_seed(args.seed)
 
 print(f'Free VRAM {get_cuda_free_memory_gb(gpu)} GB')
+# gpus with <40gb vram use cpu offloading to fit the model
 low_memory = get_cuda_free_memory_gb(gpu) < 40
 
 torch.set_grad_enabled(False)
@@ -58,19 +60,19 @@ config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 
-# Initialize pipeline
+# few-step (distilled) model uses a fixed denoising_step_list; otherwise use full diffusion
 if hasattr(config, 'denoising_step_list'):
-    # Few-step inference
     pipeline = CausalInferencePipeline(config, device=device)
 else:
-    # Multi-step diffusion inference
     pipeline = CausalDiffusionInferencePipeline(config, device=device)
 
+# load finetuned weights; prefer ema weights if available (usually better quality)
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")
     pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
+# on low-vram gpus, dynamically swap text encoder layers to/from cpu as needed
 if low_memory:
     DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
 else:
@@ -79,7 +81,7 @@ pipeline.generator.to(device=gpu)
 pipeline.vae.to(device=gpu)
 
 
-# Create dataset
+# build dataset from prompt file; i2v also needs an input image per prompt
 if args.i2v:
     assert not dist.is_initialized(), "I2V does not support distributed inference yet"
     transform = transforms.Compose([
@@ -93,16 +95,18 @@ else:
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
+# distribute prompts evenly across gpus; sequential otherwise
 if dist.is_initialized():
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
 else:
     sampler = SequentialSampler(dataset)
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
 
-# Create output directory (only on main process to avoid race conditions)
+# only rank 0 creates the output dir to avoid filesystem race conditions
 if local_rank == 0:
     os.makedirs(args.output_folder, exist_ok=True)
 
+# wait for rank 0 to finish creating the directory before other ranks proceed
 if dist.is_initialized():
     dist.barrier()
 
@@ -123,34 +127,32 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
 
-    # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
-    # Unpack the batch data for convenience
     if isinstance(batch_data, dict):
         batch = batch_data
     elif isinstance(batch_data, list):
-        batch = batch_data[0]  # First (and only) item in the batch
+        batch = batch_data[0]
 
     all_video = []
-    num_generated_frames = 0  # Number of generated (latent) frames
+    num_generated_frames = 0
 
     if args.i2v:
-        # For image-to-video, batch contains image and caption
-        prompt = batch['prompts'][0]  # Get caption from batch
+        prompt = batch['prompts'][0]
         prompts = [prompt] * args.num_samples
 
-        # Process the image
+        # reshape image to (b, c, t=1, h, w) for the vae encoder
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
 
-        # Encode the input image as the first latent
+        # encode first frame as a latent; the model autoregressively generates the rest
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
         initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
 
+        # noise for all frames except the first (which is given as initial_latent)
         sampled_noise = torch.randn(
             [args.num_samples, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
     else:
-        # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
+        # extended prompts are llm-expanded versions for richer conditioning
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         if extended_prompt is not None:
             prompts = [extended_prompt] * args.num_samples
@@ -158,11 +160,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             prompts = [prompt] * args.num_samples
         initial_latent = None
 
+        # noise for all frames; shape: (samples, frames, latent_channels, h, w)
         sampled_noise = torch.randn(
             [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
-    # Generate 81 frames
+    # run autoregressive denoising; returns pixel-space video and intermediate latents
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -170,21 +173,21 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         initial_latent=initial_latent,
         low_memory=low_memory,
     )
+    # rearrange from (b, t, c, h, w) to (b, t, h, w, c) for write_video
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
 
-    # Final output video
+    # scale [0,1] floats to [0,255] uint8 for video writing
     video = 255.0 * torch.cat(all_video, dim=1)
 
-    # Clear VAE cache
+    # clear vae's internal frame cache between prompts to free memory
     pipeline.vae.model.clear_cache()
 
-    # Save the video if the current prompt is not a dummy prompt
+    # skip saving if this is a padding prompt added by distributed sampler
     if idx < num_prompts:
         model = "regular" if not args.use_ema else "ema"
         for seed_idx in range(args.num_samples):
-            # All processes save their videos
             if args.save_with_index:
                 output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
             else:

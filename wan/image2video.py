@@ -9,6 +9,7 @@ import types
 from contextlib import contextmanager
 from functools import partial
 
+import click
 import numpy as np
 import torch
 import torch.cuda.amp as amp
@@ -73,6 +74,7 @@ class WanI2V:
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
+        click.echo(click.style("[WanI2V] Loading T5 text encoder...", fg="cyan", bold=True), err=False)
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -81,23 +83,29 @@ class WanI2V:
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None,
         )
+        click.echo(click.style("[WanI2V] T5 loaded.", fg="green"), err=False)
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        click.echo(click.style("[WanI2V] Loading VAE...", fg="cyan", bold=True), err=False)
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
+        click.echo(click.style("[WanI2V] VAE loaded.", fg="green"), err=False)
 
+        click.echo(click.style("[WanI2V] Loading CLIP...", fg="cyan", bold=True), err=False)
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+        click.echo(click.style("[WanI2V] CLIP loaded.", fg="green"), err=False)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        click.echo(click.style("[WanI2V] Loading WanModel (DiT)...", fg="cyan", bold=True), err=False)
         self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
+        click.echo(click.style("[WanI2V] WanModel loaded.", fg="green"), err=False)
 
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
@@ -195,16 +203,17 @@ class WanI2V:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+        lat_f = (F - 1) // self.vae_stride[0] + 1
         noise = torch.randn(
             16,
-            21,
+            lat_f,
             lat_h,
             lat_w,
             dtype=torch.float32,
             generator=seed_g,
             device=self.device)
 
-        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
+        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
@@ -217,6 +226,7 @@ class WanI2V:
             n_prompt = self.sample_neg_prompt
 
         # preprocess
+        tqdm.write(click.style(f"  [generate] T5 encoding (lat {lat_h}x{lat_w}, {frame_num} frames)...", fg="cyan"))
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -229,17 +239,19 @@ class WanI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
+        tqdm.write(click.style("  [generate] CLIP encoding...", fg="cyan"))
         self.clip.model.to(self.device)
         clip_context = self.clip.visual([img[:, None, :, :]])
         if offload_model:
             self.clip.model.cpu()
 
+        tqdm.write(click.style("  [generate] VAE encoding...", fg="cyan"))
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
                     img[None].cpu(), size=(h, w), mode='bicubic').transpose(
                         0, 1),
-                torch.zeros(3, 80, h, w)
+                torch.zeros(3, F - 1, h, w)
             ],
                 dim=1).to(self.device)
         ])[0]
@@ -296,7 +308,7 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps)):
+            for _, t in enumerate(tqdm(timesteps, desc="  denoising", leave=True)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -333,8 +345,10 @@ class WanI2V:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
+            tqdm.write(click.style("  [generate] VAE decoding...", fg="cyan"))
             if self.rank == 0:
                 videos = self.vae.decode(x0)
+            tqdm.write(click.style("  [generate] Done.", fg="green"))
 
         del noise, latent
         del sample_scheduler

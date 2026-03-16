@@ -1,20 +1,61 @@
+# --- frame generation mode ---
+
+# if true, generate the first frame independently (no causal dependency),
+# then autoregressively generate the rest; useful for i2v where frame 0 is given
 independent_first_frame: false
+
+# if true, the raw denoising step indices are remapped through the scheduler's
+# timestep table so they align with the actual flow-matching timestep values
 warp_denoising_step: false
+
+# --- optimizer ---
 weight_decay: 0.01
+
+# if true, all autoregressive blocks share the same randomly sampled denoising
+# timestep during a training step (cheaper, less diverse signal)
 same_step_across_blocks: true
+
+# learning rate multiplier applied to the discriminator optimizer (gan trainer only)
 discriminator_lr_multiplier: 1.0
+
+# if true, only compute the distillation loss at the final denoising step
+# instead of all steps in denoising_step_list (reduces compute, less stable)
 last_step_only: false
+
+# image-to-video mode; overridden by --i2v flag at runtime
 i2v: false
+
+# number of latent frames used per training forward pass (must be a multiple of num_frame_per_block)
 num_training_frames: 21
+
+# run python garbage collection every this many optimizer steps to reclaim memory
 gc_interval: 100
+
+# noise level injected into context (already-generated) frames during training;
+# 0 means clean context, higher values add robustness to autoregressive error accumulation
 context_noise: 0
+
+# use causal (autoregressive) attention in the generator; must be true for self-forcing
 causal: true
 
+# --- evaluation / logging ---
+
+# training step to resume from (0 = fresh start)
 ckpt_step: 0
+
+# name of the eval prompt set (used as a label in logs)
 prompt_name: MovieGenVideoBench
+
+# path to text prompts used for periodic validation video generation
 prompt_path: prompts/MovieGenVideoBench.txt
+
+# how many prompts from the eval set to use during validation
 eval_first_n: 64
+
+# number of video samples to generate per prompt during eval
 num_samples: 1
-height: 480
-width: 832
-num_frames: 81
+
+# --- video resolution ---
+height: 480   # pixel height of generated videos
+width: 832    # pixel width of generated videos
+num_frames: 81  # total frames in a full generated video (≈5s at 16fps)
